@@ -1,0 +1,1 @@
+- [主线程卡顿监控采样设计原理](project_monitor_sampling_design.md) — Monitor 模块为何用后台线程过程采样定位耗时方法，而非超时后单次抓主线程栈
