@@ -25,6 +25,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -36,6 +37,8 @@ import androidx.compose.ui.unit.dp
 import com.newolf.monitor.MainThreadMonitor
 import com.newolf.monitor.MonitorConfig
 import com.newolf.monitor.test.ui.theme.MonitorTheme
+import kotlinx.coroutines.flow.sample
+import kotlinx.coroutines.flow.map
 
 class MainActivity : ComponentActivity() {
 
@@ -189,7 +192,10 @@ fun TestScreen(
     onBlock2000: () -> Unit,
     onOneClickTest: (onComplete: () -> Unit) -> Unit,
 ) {
-    var statisticsText by remember { mutableStateOf("暂无统计数据，点击按钮测试") }
+    // 统计摘要以 Flow 形式自动观测：MonitorStatistics 每次更新都会发射最新摘要，
+    // UI 通过 collectAsState 自动重组，无需手动点击刷新。
+    // 注意：statisticsText 的读取被限制在下方 StatisticsSection 内部，
+    // 使其变化只重组统计文本区域，而不波及上方的标题与全部按钮。
     var isTesting by remember { mutableStateOf(false) }
 
     // 大屏（车机横屏）优化：限制内容最大宽度并居中，放大字号与按钮高度
@@ -228,10 +234,8 @@ fun TestScreen(
         Button(
             onClick = {
                 isTesting = true
-                statisticsText = "一键测试进行中，请稍候…"
                 onOneClickTest {
-                    // 测试全部完成后自动刷新并展示统计信息
-                    statisticsText = monitor.statistics.getSummary()
+                    // 统计摘要通过 summaryFlow 自动观测刷新，无需在此手动赋值
                     isTesting = false
                 }
             },
@@ -272,25 +276,56 @@ fun TestScreen(
 
         Spacer(modifier = Modifier.height(20.dp))
 
-        // 统计信息区域
-        Button(
-            onClick = { statisticsText = monitor.statistics.getSummary() },
-            modifier = buttonModifier
-        ) {
-            Text(
-                text = "刷新统计信息",
-                style = MaterialTheme.typography.titleMedium
-            )
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
+        // 统计信息区域（Flow 自动观测，实时刷新，无需手动点击）
         Text(
-            text = statisticsText,
-            style = MaterialTheme.typography.bodyLarge,
+            text = "统计信息（实时自动刷新）",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            modifier = contentModifier
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // 统计文本区域隔离为独立 Composable：summaryFlow 的观测与读取都发生在其内部，
+        // 因此摘要刷新时只重组这一小块 Text，上方标题和所有按钮不会参与重组。
+        StatisticsSection(
+            monitor = monitor,
+            isTesting = isTesting,
             modifier = contentModifier
         )
     }
+}
+
+/**
+ * 统计信息展示区。将统计观测收敛到此 Composable 内部，
+ * 使刷新的重组范围被限制在这块文本，避免波及外层按钮列表。
+ *
+ * 关键 GC 优化：发射端(versionFlow)在主线程每条消息只自增版本号(Long,零分配)，不拼字符串。
+ * 这里在 UI 侧先用 [sample] 按 500ms 采样，再在采样后的低频路径才 map { getSummary() } 构建
+ * 字符串。因此摘要字符串每 500ms 最多构建一次，而非随每条主线程消息高频构建，从根本上消除
+ * 大量临时字符串对象、抑制频繁 GC。
+ */
+@Composable
+private fun StatisticsSection(
+    monitor: MainThreadMonitor,
+    isTesting: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    // remember 确保派生 Flow 只创建一次：版本号 -> 采样 -> 低频构建字符串。
+    val summaryFlow = remember(monitor) {
+        monitor.statistics.versionFlow
+            .sample(500L)
+            .map { monitor.statistics.getSummary() }
+    }
+    // 首帧同步构建一次作为初值，之后仅按采样节奏在低频路径构建。
+    val statisticsText by summaryFlow.collectAsState(
+        initial = monitor.statistics.getSummary()
+    )
+    Text(
+        text = if (isTesting) "一键测试进行中，请稍候…\n\n$statisticsText" else statisticsText,
+        style = MaterialTheme.typography.bodyLarge,
+        modifier = modifier
+    )
 }
 
 @Composable

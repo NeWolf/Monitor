@@ -2,12 +2,18 @@ package com.newolf.monitor
 
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
-
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 /**
  * 主线程耗时监控统计信息
  *
  * 记录各阈值级别的触发次数、最大耗时、总消息数等统计数据。
  * 线程安全，可在任意线程读取。
+ *
+ * 统计更新以 [versionFlow]（版本号 [StateFlow]）形式暴露：每当统计数据发生变化（处理消息、
+ * 触发阻塞、重置），只自增版本号（零对象分配），UI 层 collect 观测到更新后，在低频路径（采样后）
+ * 自行调用 [getSummary] 构建摘要字符串，从而避免在高频统计路径拼接字符串引发频繁 GC。
  */
 class MonitorStatistics {
 
@@ -30,6 +36,34 @@ class MonitorStatistics {
     private val thresholdCulpritCounts = ConcurrentHashMap<Long, ConcurrentHashMap<String, AtomicLong>>()
 
     /**
+     * 统计变更信号流（内部写入）。它只作为「统计发生了变化」的开关信号，值本身无业务含义，
+     * UI 层观测到值变化即知道需要在低频路径重新构建摘要。
+     *
+     * 关键(零装箱)：这里不再自增版本号。自增会让 [MutableStateFlow] 每次装箱出一个新的
+     * java.lang.Long(值超出 JVM 的 Long 缓存区间 [-128,127] 后必然新建对象),在 60fps 高频
+     * 路径上持续制造小对象。改为在两个固定值 0L / 1L 之间交替:二者都落在 Long 缓存区间内,
+     * Long.valueOf 直接返回被复用的缓存实例,不产生任何新对象;而 0 != 1 又能打破 StateFlow
+     * 的 equals 去重,确保每条消息都能通知下游。由此实现「零新增装箱」的变更通知。
+     */
+    private val _versionFlow = MutableStateFlow(0L)
+
+    /**
+     * 统计变更信号流,UI 层可 collect 观测「是否有更新」。
+     *
+     * 值在 0L / 1L 间交替翻转,仅表示「有新变化」,不代表版本序号或消息计数。真实计数请读取
+     * [totalMessages] 等 Atomic 字段。字符串摘要由 UI 侧 sample 之后的低频路径调用 [getSummary] 构建。
+     */
+    val versionFlow: StateFlow<Long> = _versionFlow.asStateFlow()
+
+    /**
+     * 标记统计已更新:在 0L / 1L 间翻转信号值,不做任何字符串拼接、不新建对象(零装箱)。
+     * 任意统计更新后调用。翻转而非自增是为了让发射值始终落在 JVM Long 缓存区间内,复用缓存实例。
+     */
+    private fun emitSummary() {
+        _versionFlow.value = if (_versionFlow.value == 0L) 1L else 0L
+    }
+
+    /**
      * 当一个消息处理完成时调用，更新总消息数和最大耗时
      */
     fun onMessageProcessed(durationMs: Long) {
@@ -40,6 +74,7 @@ class MonitorStatistics {
             current = maxDurationMs.get()
             if (durationMs <= current) break
         } while (!maxDurationMs.compareAndSet(current, durationMs))
+        emitSummary()
     }
 
     /**
@@ -56,6 +91,7 @@ class MonitorStatistics {
             .computeIfAbsent(threshold) { ConcurrentHashMap() }
             .computeIfAbsent(method) { AtomicLong(0) }
             .incrementAndGet()
+        emitSummary()
     }
 
     /**
@@ -96,12 +132,18 @@ class MonitorStatistics {
         thresholdHitCounts.clear()
         thresholdTotalDurations.clear()
         thresholdCulpritCounts.clear()
+        emitSummary()
     }
 
     /**
-     * 生成统计摘要信息
+     * 生成统计摘要信息。UI 侧应在观测到 [versionFlow] 更新并做低频采样后再调用此方法构建字符串。
      */
-    fun getSummary(): String {
+    fun getSummary(): String = buildSummary()
+
+    /**
+     * 生成统计摘要字符串
+     */
+    private fun buildSummary(): String {
         return buildString {
             appendLine("===== 主线程监控统计 =====")
             appendLine("总消息数: ${totalMessages.get()}")

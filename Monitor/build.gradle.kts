@@ -20,6 +20,7 @@ android {
 }
 
 dependencies {
+    implementation(libs.kotlinx.coroutines.android)
     compileOnly(libs.androidx.appcompat)
     compileOnly(libs.androidx.core.ktx)
     compileOnly(libs.material)
